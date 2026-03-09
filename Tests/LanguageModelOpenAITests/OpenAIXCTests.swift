@@ -86,6 +86,140 @@ final class OpenAIXCTests: XCTestCase {
         XCTAssertEqual(responseFormat?["type"] as? String, "json_schema")
         XCTAssertEqual(jsonSchema?["strict"] as? Bool, true)
     }
+
+    func testStrictSchemaRejectionMapsUnsupportedCapability() async throws {
+        MockOpenAIURLProtocol.requestHandler = { request in
+            (
+                HTTPURLResponse(url: request.url!, statusCode: 400, httpVersion: nil, headerFields: nil)!,
+                Data(#"{"error":{"message":"response_format json_schema strict is not supported","type":"invalid_request_error","code":"unsupported_response_format"}}"#.utf8)
+            )
+        }
+        let backend = OpenAIStructuredOutputBackend(session: makeSession())
+        let spec = StructuredOutput.codable(
+            OpenAIStructuredPayload.self,
+            schema: .object(
+                ObjectSchema(
+                    name: "OpenAIStructuredPayload",
+                    properties: [.init(name: "title", schema: .string())]
+                )
+            )
+        )
+
+        do {
+            _ = try await backend.generateStructured(
+                endpoint: ModelEndpoint(
+                    backendID: backend.backendID,
+                    modelID: "gpt-demo",
+                    options: ["baseURL": "https://example.com", "apiKey": "secret"]
+                ),
+                instructions: nil,
+                locale: nil,
+                prompt: "Generate",
+                spec: spec,
+                options: StructuredGenerationOptions(maximumResponseTokens: 64, deterministic: true)
+            )
+            XCTFail("Expected unsupported capability error")
+        } catch let error as RuntimeError {
+            XCTAssertEqual(
+                error,
+                .unsupportedCapability("response_format json_schema strict is not supported")
+            )
+        }
+    }
+
+    func testRefusalMappingFromCompletionPayload() async throws {
+        MockOpenAIURLProtocol.requestHandler = { request in
+            (
+                HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!,
+                Data(#"{"choices":[{"finish_reason":"content_filter","message":{"content":[{"type":"refusal","text":"Nope"}]}}]}"#.utf8)
+            )
+        }
+        let backend = OpenAIInferenceBackend(session: makeSession())
+        let session = try await backend.makeSession(
+            endpoint: ModelEndpoint(
+                backendID: backend.backendID,
+                modelID: "gpt-demo",
+                options: ["baseURL": "https://example.com", "apiKey": "secret"]
+            ),
+            instructions: nil,
+            locale: nil
+        )
+
+        do {
+            _ = try await session.generateText(prompt: "Hi", options: TextGenerationOptions())
+            XCTFail("Expected refusal")
+        } catch let error as RuntimeError {
+            XCTAssertEqual(error, .refusal("Nope"))
+        }
+    }
+
+    func testStreamingYieldsPartials() async throws {
+        MockOpenAIURLProtocol.requestHandler = { request in
+            let payload = "data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\n\n"
+                + "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\n"
+                + "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
+                + "data: [DONE]\n\n"
+            return (
+                HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!,
+                Data(payload.utf8)
+            )
+        }
+        let backend = OpenAIInferenceBackend(session: makeSession())
+        let session = try await backend.makeSession(
+            endpoint: ModelEndpoint(
+                backendID: backend.backendID,
+                modelID: "gpt-demo",
+                options: ["baseURL": "https://example.com", "apiKey": "secret"]
+            ),
+            instructions: nil,
+            locale: nil
+        )
+
+        var partials: [String] = []
+        var completed: TextGenerationResult?
+        let stream = await session.streamText(prompt: "Hi", options: TextGenerationOptions())
+        for try await event in stream {
+            switch event {
+            case .partial(let text):
+                partials.append(text)
+            case .completed(let result):
+                completed = result
+            }
+        }
+
+        XCTAssertEqual(partials, ["hel", "lo"])
+        XCTAssertEqual(completed, TextGenerationResult(text: "hello"))
+    }
+
+    func testStreamingMapsRefusal() async throws {
+        MockOpenAIURLProtocol.requestHandler = { request in
+            let payload = "data: {\"choices\":[{\"delta\":{\"refusal\":\"Blocked\"},\"finish_reason\":\"content_filter\"}]}\n\n"
+                + "data: [DONE]\n\n"
+            return (
+                HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!,
+                Data(payload.utf8)
+            )
+        }
+        let backend = OpenAIInferenceBackend(session: makeSession())
+        let session = try await backend.makeSession(
+            endpoint: ModelEndpoint(
+                backendID: backend.backendID,
+                modelID: "gpt-demo",
+                options: ["baseURL": "https://example.com", "apiKey": "secret"]
+            ),
+            instructions: nil,
+            locale: nil
+        )
+
+        let stream = await session.streamText(prompt: "Hi", options: TextGenerationOptions())
+
+        do {
+            for try await _ in stream {}
+            XCTFail("Expected refusal")
+        } catch let error as RuntimeError {
+            XCTAssertEqual(error, .refusal("Blocked"))
+        }
+    }
 }
 
 private struct OpenAIStructuredPayload: Codable, Sendable, Equatable {

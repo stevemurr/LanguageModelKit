@@ -302,22 +302,30 @@ public enum ReducerKind: String, Codable, Sendable, Equatable {
 }
 
 public struct CompactionReport: Codable, Sendable, Equatable {
-    public let mode: CompactionMode
+    public let requestedMode: CompactionMode
+    public let effectiveMode: CompactionMode
+    public let downgradeReason: String?
     public let tokensBefore: Int
     public let tokensAfter: Int
     public let reducersApplied: [ReducerKind]
     public let summaryCreated: Bool
     public let spilledBlobCount: Int
 
+    public var mode: CompactionMode { requestedMode }
+
     public init(
-        mode: CompactionMode,
+        requestedMode: CompactionMode,
+        effectiveMode: CompactionMode? = nil,
+        downgradeReason: String? = nil,
         tokensBefore: Int,
         tokensAfter: Int,
         reducersApplied: [ReducerKind],
         summaryCreated: Bool,
         spilledBlobCount: Int
     ) {
-        self.mode = mode
+        self.requestedMode = requestedMode
+        self.effectiveMode = effectiveMode ?? requestedMode
+        self.downgradeReason = downgradeReason
         self.tokensBefore = tokensBefore
         self.tokensAfter = tokensAfter
         self.reducersApplied = reducersApplied

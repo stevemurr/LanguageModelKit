@@ -1,4 +1,6 @@
 import Foundation
+import LanguageModelRuntime
+import LanguageModelStructuredCore
 
 public actor ContextManager {
     private let configuration: ContextManagerConfiguration
@@ -73,6 +75,7 @@ public actor ContextManager {
         var prepared = try await preparePlan(
             for: logicalThread,
             prompt: prompt,
+            budgetEndpoint: logicalThread.configuration.runtime.inference,
             schemaDescription: nil,
             compactionOptions: .standard(memoryPolicy: configuration.memory)
         )
@@ -138,10 +141,15 @@ public actor ContextManager {
     ) async throws -> StructuredReply<Value> {
         let logicalThread = try await requireThread(threadID)
         try await validateAvailability(for: logicalThread)
-        let schemaDescription = (try? String(data: JSONEncoder().encode(spec.schema), encoding: .utf8)) ?? String(describing: spec.schema)
+        let structuredEndpoint = logicalThread.configuration.runtime.structuredOutput ?? logicalThread.configuration.runtime.inference
+        let schemaDescription = (try? PortableSchemaRenderer.renderString(
+            schema: spec.schema,
+            name: "response"
+        )) ?? String(describing: spec.schema)
         var prepared = try await preparePlan(
             for: logicalThread,
             prompt: prompt,
+            budgetEndpoint: structuredEndpoint,
             schemaDescription: schemaDescription,
             compactionOptions: .standard(memoryPolicy: configuration.memory)
         )
@@ -203,6 +211,7 @@ public actor ContextManager {
         var prepared = try await preparePlan(
             for: logicalThread,
             prompt: prompt,
+            budgetEndpoint: logicalThread.configuration.runtime.inference,
             schemaDescription: nil,
             compactionOptions: .standard(memoryPolicy: configuration.memory)
         )
@@ -283,12 +292,15 @@ public actor ContextManager {
         var prepared = try await preparePlan(
             for: logicalThread,
             prompt: "Manual compaction request",
+            budgetEndpoint: logicalThread.configuration.runtime.inference,
             schemaDescription: nil,
             compactionOptions: .manual(memoryPolicy: configuration.memory)
         )
         prepared.plan.requiresBridge = true
         let report = makeCompactionReport(from: prepared.plan) ?? CompactionReport(
-            mode: configuration.compaction.mode,
+            requestedMode: configuration.compaction.mode,
+            effectiveMode: prepared.plan.effectiveCompactionMode,
+            downgradeReason: prepared.plan.downgradeReason,
             tokensBefore: prepared.plan.budget.projectedTotalTokens,
             tokensAfter: prepared.plan.budget.projectedTotalTokens,
             reducersApplied: [],
@@ -411,6 +423,26 @@ public actor ContextManager {
         spec: StructuredOutputSpec<Value>
     ) async throws -> StructuredGenerationResult<Value> {
         let endpoint = prepared.thread.configuration.runtime.structuredOutput ?? prepared.thread.configuration.runtime.inference
+        let inferenceEndpoint = prepared.thread.configuration.runtime.inference
+        if endpoint == inferenceEndpoint {
+            let live = try await session(
+                for: prepared.thread,
+                durableMemory: prepared.plan.durableMemory,
+                recentTail: prepared.plan.recentTail,
+                forceBridge: prepared.plan.requiresBridge || prepared.bridge != nil
+            )
+            if let structuredSession = live as? any LiveStructuredGenerationSession {
+                return try await structuredSession.generateStructured(
+                    prompt: prompt,
+                    spec: spec,
+                    options: StructuredGenerationOptions(
+                        maximumResponseTokens: configuration.budget.reservedOutputTokens,
+                        deterministic: true
+                    )
+                )
+            }
+        }
+
         guard let backend = configuration.structuredBackends[endpoint.backendID] else {
             throw RuntimeError.unsupportedCapability("No structured backend configured for \(endpoint.backendID)")
         }
@@ -435,6 +467,7 @@ public actor ContextManager {
     private func preparePlan(
         for logicalThread: LogicalThread,
         prompt: String,
+        budgetEndpoint: ModelEndpoint,
         schemaDescription: String?,
         compactionOptions: CompactionOptions
     ) async throws -> PreparedRequest {
@@ -447,6 +480,7 @@ public actor ContextManager {
         let recentTail = recentTail(from: logicalThread.state.turns)
         let budget = try await calculateBudget(
             thread: logicalThread,
+            endpoint: budgetEndpoint,
             durableMemory: durableMemory,
             retrievedMemory: retrievedMemory,
             recentTail: recentTail,
@@ -455,13 +489,16 @@ public actor ContextManager {
         )
         var plan = ContextPlan(
             state: logicalThread.state,
+            budgetEndpoint: budgetEndpoint,
             durableMemory: durableMemory,
             retrievedMemory: retrievedMemory,
             recentTail: recentTail,
             currentPrompt: prompt,
             schemaDescription: schemaDescription,
             budget: budget,
-            originalProjectedTotalTokens: nil
+            originalProjectedTotalTokens: nil,
+            effectiveCompactionMode: configuration.compaction.mode,
+            downgradeReason: nil
         )
         plan = try await compact(
             plan: plan,
@@ -488,13 +525,14 @@ public actor ContextManager {
 
     private func calculateBudget(
         thread: LogicalThread,
+        endpoint: ModelEndpoint,
         durableMemory: [DurableMemoryRecord],
         retrievedMemory: [DurableMemoryRecord],
         recentTail: [NormalizedTurn],
         prompt: String,
         schemaDescription: String?
     ) async throws -> BudgetReport {
-        let contextWindowTokens = try await resolvedContextWindowTokens(for: thread.configuration.runtime.inference)
+        let contextWindowTokens = try await resolvedContextWindowTokens(for: endpoint)
         let renderedPrompt = renderedPrompt(
             instructions: thread.state.instructions,
             durableMemory: durableMemory,
@@ -505,7 +543,7 @@ public actor ContextManager {
         )
 
         if configuration.budget.exactCountingPreferred,
-           let estimator = try await exactEstimator(for: thread.configuration.runtime.inference),
+           let estimator = try await exactEstimator(for: endpoint),
            let estimate = await estimator.estimate(
             prompt: renderedPrompt,
             reservedOutputTokens: configuration.budget.reservedOutputTokens
@@ -552,20 +590,21 @@ public actor ContextManager {
         }
 
         for reducer in reducers(for: configuration.compaction.mode) {
-            let changed = try await apply(
-                reducer: reducer,
-                to: &plan,
-                threadConfiguration: threadConfiguration,
-                options: options
-            )
-            guard changed else {
+            guard let updatedPlan = try await reducer.run(
+                self,
+                plan,
+                threadConfiguration,
+                options
+            ) else {
                 continue
             }
 
-            plan.reducersApplied.append(reducer)
+            plan = updatedPlan
+            plan.reducersApplied.append(reducer.kind)
             plan.requiresBridge = true
             plan.budget = try await calculateBudget(
                 thread: LogicalThread(state: plan.state, configuration: threadConfiguration),
+                endpoint: plan.budgetEndpoint,
                 durableMemory: plan.durableMemory,
                 retrievedMemory: plan.retrievedMemory,
                 recentTail: plan.recentTail,
@@ -579,60 +618,77 @@ public actor ContextManager {
         }
 
         logger.compaction(
-            "before=\(initialPlan.budget.projectedTotalTokens) after=\(plan.budget.projectedTotalTokens) reducers=\(plan.reducersApplied.map(\.rawValue).joined(separator: ","))"
+            "before=\(initialPlan.budget.projectedTotalTokens) after=\(plan.budget.projectedTotalTokens) reducers=\(plan.reducersApplied.map(\.rawValue).joined(separator: ",")) effective=\(plan.effectiveCompactionMode.rawValue)"
         )
         return plan
     }
 
-    private func reducers(for mode: CompactionMode) -> [ReducerKind] {
-        switch mode {
-        case .slidingWindow:
-            return [.toolPayloadDigester, .dropLowPriorityRetrievedMemory, .slidingTail, .emergencyReset]
-        case .structuredSummary:
-            return [.toolPayloadDigester, .dropLowPriorityRetrievedMemory, .structuredSummary, .slidingTail, .emergencyReset]
-        case .hybrid:
-            return [.toolPayloadDigester, .dropLowPriorityRetrievedMemory, .slidingTail, .structuredSummary, .emergencyReset]
+    private func reducers(for mode: CompactionMode) -> [AnyCompactionReducer] {
+        let minimumTailCount = max(1, min(configuration.compaction.maxRecentTurns, 4))
+        let toolPayloadDigester = AnyCompactionReducer(kind: .toolPayloadDigester) { manager, plan, _, _ in
+            var updated = plan
+            guard try await manager.applyToolPayloadDigester(to: &updated) else {
+                return nil
+            }
+            return updated
         }
-    }
-
-    private func apply(
-        reducer: ReducerKind,
-        to plan: inout ContextPlan,
-        threadConfiguration: ThreadConfiguration,
-        options: CompactionOptions
-    ) async throws -> Bool {
-        switch reducer {
-        case .toolPayloadDigester:
-            return try await applyToolPayloadDigester(to: &plan)
-        case .dropLowPriorityRetrievedMemory:
+        let dropRetrievedMemory = AnyCompactionReducer(kind: .dropLowPriorityRetrievedMemory) { _, plan, _, _ in
             guard plan.retrievedMemory.isEmpty == false else {
-                return false
+                return nil
             }
-            plan.retrievedMemory = []
-            return true
-        case .slidingTail:
-            guard plan.recentTail.count > 4 else {
-                return false
+            var updated = plan
+            updated.retrievedMemory = []
+            return updated
+        }
+        let slidingTail = AnyCompactionReducer(kind: .slidingTail) { _, plan, _, _ in
+            guard plan.recentTail.count > minimumTailCount else {
+                return nil
             }
-            let reducedCount = max(4, plan.recentTail.count / 2)
-            plan.recentTail = Array(plan.recentTail.suffix(reducedCount))
-            return true
-        case .structuredSummary:
-            return try await applyStructuredSummary(
-                to: &plan,
+            var updated = plan
+            let reducedCount = max(minimumTailCount, plan.recentTail.count / 2)
+            updated.recentTail = Array(plan.recentTail.suffix(reducedCount))
+            return updated
+        }
+        let structuredSummary = AnyCompactionReducer(kind: .structuredSummary) { manager, plan, threadConfiguration, options in
+            var updated = plan
+            let didSummarize = try await manager.applyStructuredSummary(
+                to: &updated,
                 threadConfiguration: threadConfiguration,
                 options: options
             )
-        case .emergencyReset:
+            if didSummarize
+                || updated.downgradeReason != plan.downgradeReason
+                || updated.effectiveCompactionMode != plan.effectiveCompactionMode
+            {
+                return updated
+            }
+            else {
+                return nil
+            }
+        }
+        let emergencyReset = AnyCompactionReducer(kind: .emergencyReset) { _, plan, _, _ in
             let currentPrompt = plan.currentPrompt
             let reducedMemory = plan.durableMemory.filter { $0.pinned || $0.priority >= 900 }
             let reducedTail = Array(plan.state.turns.suffix(2))
             let changed = reducedMemory.count != plan.durableMemory.count || reducedTail.count != plan.recentTail.count
-            plan.durableMemory = reducedMemory
-            plan.retrievedMemory = []
-            plan.recentTail = reducedTail
-            plan.currentPrompt = currentPrompt
-            return changed
+            guard changed else {
+                return nil
+            }
+            var updated = plan
+            updated.durableMemory = reducedMemory
+            updated.retrievedMemory = []
+            updated.recentTail = reducedTail
+            updated.currentPrompt = currentPrompt
+            return updated
+        }
+
+        switch mode {
+        case .slidingWindow:
+            return [toolPayloadDigester, dropRetrievedMemory, slidingTail, emergencyReset]
+        case .structuredSummary:
+            return [toolPayloadDigester, dropRetrievedMemory, structuredSummary, slidingTail, emergencyReset]
+        case .hybrid:
+            return [toolPayloadDigester, dropRetrievedMemory, slidingTail, structuredSummary, emergencyReset]
         }
     }
 
@@ -696,36 +752,33 @@ public actor ContextManager {
         threadConfiguration: ThreadConfiguration,
         options: CompactionOptions
     ) async throws -> Bool {
-        let endpoint = threadConfiguration.runtime.structuredOutput ?? threadConfiguration.runtime.inference
-        guard configuration.structuredBackends[endpoint.backendID] != nil else {
-            logger.compaction("structured summary unavailable for \(endpoint.backendID), downgrading to sliding window")
-            return false
-        }
-
         let tailIDs = Set(plan.recentTail.map(\.id))
         let candidates = plan.state.turns.filter { tailIDs.contains($0.id) == false && $0.compacted == false }
         guard candidates.isEmpty == false else {
             return false
         }
 
-        let summaryPrompt = candidates
-            .map { "\($0.role.rawValue.capitalized): \($0.text)" }
-            .joined(separator: "\n")
-
         do {
-            let response = try await generateStructured(
-                prepared: PreparedRequest(
-                    thread: LogicalThread(state: plan.state, configuration: threadConfiguration),
-                    plan: plan,
-                    bridge: nil
-                ),
-                prompt: """
-                Compact this conversation history conservatively. Preserve only durable facts, constraints, decisions, open tasks, and a short summaryText. Do not invent information.
-
-                Transcript:
-                \(summaryPrompt)
-                """,
-                spec: compactionSpec
+            let chunks = chunked(
+                items: candidates,
+                targetTokens: max(1, configuration.compaction.chunkTargetTokens),
+                tokenCount: { roughTokenCount("\($0.role.rawValue.capitalized): \($0.text)") }
+            )
+            var envelopes: [CompactionEnvelope] = []
+            envelopes.reserveCapacity(chunks.count)
+            for chunk in chunks {
+                envelopes.append(
+                    try await summarizeTurnChunk(
+                        chunk,
+                        threadConfiguration: threadConfiguration,
+                        plan: plan
+                    )
+                )
+            }
+            let merged = try await mergeCompactionEnvelopes(
+                envelopes,
+                threadConfiguration: threadConfiguration,
+                plan: plan
             )
             plan.state.turns = plan.state.turns.map { turn in
                 guard candidates.contains(where: { $0.id == turn.id }) else {
@@ -743,7 +796,7 @@ public actor ContextManager {
                     compacted: true
                 )
             }
-            let summaryText = renderSummary(response.value)
+            let summaryText = renderSummary(merged)
             plan.state.turns.append(
                 NormalizedTurn(
                     role: .summary,
@@ -754,17 +807,131 @@ public actor ContextManager {
                 )
             )
             if options.allowMemoryExtraction {
-                plan.durableMemory = merge(summary: response.value, into: plan.durableMemory)
+                plan.durableMemory = merge(summary: merged, into: plan.durableMemory)
             }
             plan.summaryCreated = true
             return true
         } catch let error as RuntimeError {
-            if case .unsupportedCapability = error {
-                logger.compaction("structured summary translator unavailable for \(endpoint.backendID), downgrading to sliding window")
+            switch error {
+            case .unsupportedCapability, .unavailable:
+                applyStructuredSummaryDowngrade(
+                    to: &plan,
+                    reason: errorDescription(error)
+                )
                 return false
+            default:
+                throw error
             }
-            throw error
         }
+    }
+
+    private func summarizeTurnChunk(
+        _ turns: [NormalizedTurn],
+        threadConfiguration: ThreadConfiguration,
+        plan: ContextPlan
+    ) async throws -> CompactionEnvelope {
+        let summaryPrompt = turns
+            .map { "\($0.role.rawValue.capitalized): \($0.text)" }
+            .joined(separator: "\n")
+        let response = try await generateStructured(
+            prepared: PreparedRequest(
+                thread: LogicalThread(state: plan.state, configuration: threadConfiguration),
+                plan: plan,
+                bridge: nil
+            ),
+            prompt: """
+            Compact this conversation history conservatively. Preserve only durable facts, constraints, decisions, open tasks, entities, retrievalHints, and a short summaryText. Do not invent information.
+
+            Transcript:
+            \(summaryPrompt)
+            """,
+            spec: compactionSpec
+        )
+        return response.value
+    }
+
+    private func summarizeEnvelopeGroup(
+        _ envelopes: [CompactionEnvelope],
+        threadConfiguration: ThreadConfiguration,
+        plan: ContextPlan
+    ) async throws -> CompactionEnvelope {
+        let summaries = envelopes.enumerated().map { index, envelope in
+            """
+            Summary \(index + 1):
+            \(renderSummary(envelope))
+            """
+        }.joined(separator: "\n\n")
+        let response = try await generateStructured(
+            prepared: PreparedRequest(
+                thread: LogicalThread(state: plan.state, configuration: threadConfiguration),
+                plan: plan,
+                bridge: nil
+            ),
+            prompt: """
+            Merge these conservative summaries into one structured summary. Preserve facts, constraints, decisions, open tasks, entities, retrievalHints, and a short summaryText. Do not invent information.
+
+            Summaries:
+            \(summaries)
+            """,
+            spec: compactionSpec
+        )
+        return response.value
+    }
+
+    private func mergeCompactionEnvelopes(
+        _ envelopes: [CompactionEnvelope],
+        threadConfiguration: ThreadConfiguration,
+        plan: ContextPlan
+    ) async throws -> CompactionEnvelope {
+        guard envelopes.count > 1 else {
+            return envelopes.first ?? CompactionEnvelope(
+                summaryText: "",
+                stableFacts: [],
+                userConstraints: [],
+                openTasks: [],
+                decisions: [],
+                entities: [],
+                retrievalHints: []
+            )
+        }
+
+        var current = envelopes
+        var depth = 0
+        while current.count > 1 && depth < max(0, configuration.compaction.maxMergeDepth) {
+            depth += 1
+            let groups = chunked(
+                items: current,
+                targetTokens: max(1, configuration.compaction.chunkSummaryTargetTokens),
+                tokenCount: { roughTokenCount(renderSummary($0)) }
+            )
+            var nextLevel: [CompactionEnvelope] = []
+            nextLevel.reserveCapacity(groups.count)
+            for group in groups {
+                if group.count == 1, let only = group.first {
+                    nextLevel.append(only)
+                } else {
+                    nextLevel.append(
+                        try await summarizeEnvelopeGroup(
+                            group,
+                            threadConfiguration: threadConfiguration,
+                            plan: plan
+                        )
+                    )
+                }
+            }
+            current = nextLevel
+        }
+
+        return combineCompactionEnvelopes(current)
+    }
+
+    private func applyStructuredSummaryDowngrade(
+        to plan: inout ContextPlan,
+        reason: String
+    ) {
+        plan.effectiveCompactionMode = .slidingWindow
+        plan.downgradeReason = plan.downgradeReason ?? reason
+        logger.compaction("structured summary unavailable, downgrading to sliding window: \(reason)")
     }
 
     private func finalizeTextResponse(
@@ -899,13 +1066,21 @@ public actor ContextManager {
         if let override = endpoint.contextWindowOverride {
             return override
         }
-        let backend = try await configuration.runtimeRegistry.backend(for: endpoint.backendID)
-        return await backend.contextWindowTokens(for: endpoint) ?? configuration.budget.defaultContextWindowTokens
+        do {
+            let backend = try await configuration.runtimeRegistry.backend(for: endpoint.backendID)
+            return await backend.contextWindowTokens(for: endpoint) ?? configuration.budget.defaultContextWindowTokens
+        } catch {
+            return configuration.budget.defaultContextWindowTokens
+        }
     }
 
     private func exactEstimator(for endpoint: ModelEndpoint) async throws -> (any TokenEstimating)? {
-        let backend = try await configuration.runtimeRegistry.backend(for: endpoint.backendID)
-        return await backend.exactTokenEstimator(for: endpoint)
+        do {
+            let backend = try await configuration.runtimeRegistry.backend(for: endpoint.backendID)
+            return await backend.exactTokenEstimator(for: endpoint)
+        } catch {
+            return nil
+        }
     }
 
     private func renderedPrompt(
@@ -997,11 +1172,13 @@ public actor ContextManager {
     }
 
     private func makeCompactionReport(from plan: ContextPlan) -> CompactionReport? {
-        guard plan.reducersApplied.isEmpty == false else {
+        guard plan.reducersApplied.isEmpty == false || plan.downgradeReason != nil else {
             return nil
         }
         return CompactionReport(
-            mode: configuration.compaction.mode,
+            requestedMode: configuration.compaction.mode,
+            effectiveMode: plan.effectiveCompactionMode,
+            downgradeReason: plan.downgradeReason,
             tokensBefore: plan.originalProjectedTotalTokens ?? plan.budget.projectedTotalTokens,
             tokensAfter: plan.budget.projectedTotalTokens,
             reducersApplied: plan.reducersApplied,
@@ -1152,6 +1329,122 @@ public actor ContextManager {
         return lines.joined(separator: "\n")
     }
 
+    private func combineCompactionEnvelopes(
+        _ envelopes: [CompactionEnvelope]
+    ) -> CompactionEnvelope {
+        guard envelopes.count > 1 else {
+            return envelopes.first ?? CompactionEnvelope(
+                summaryText: "",
+                stableFacts: [],
+                userConstraints: [],
+                openTasks: [],
+                decisions: [],
+                entities: [],
+                retrievalHints: []
+            )
+        }
+
+        let facts = Array(
+            Dictionary(
+                envelopes
+                    .flatMap(\.stableFacts)
+                    .map { ("\($0.key)\u{1F}\($0.value)", $0) },
+                uniquingKeysWith: { current, _ in current }
+            ).values
+        ).sorted { lhs, rhs in
+            if lhs.key != rhs.key {
+                return lhs.key < rhs.key
+            }
+            return lhs.value < rhs.value
+        }
+        let constraints = Array(Set(envelopes.flatMap(\.userConstraints))).sorted()
+        let decisions = Array(Set(envelopes.flatMap(\.decisions))).sorted()
+        let retrievalHints = Array(Set(envelopes.flatMap(\.retrievalHints))).sorted()
+        let tasks = Array(
+            Dictionary(
+                envelopes
+                    .flatMap(\.openTasks)
+                    .map { ("\($0.description)\u{1F}\($0.status)", $0) },
+                uniquingKeysWith: { current, _ in current }
+            ).values
+        ).sorted { lhs, rhs in
+            if lhs.description != rhs.description {
+                return lhs.description < rhs.description
+            }
+            return lhs.status < rhs.status
+        }
+        let entities = Array(
+            Dictionary(
+                envelopes
+                    .flatMap(\.entities)
+                    .map { ("\($0.name)\u{1F}\($0.type)", $0) },
+                uniquingKeysWith: { current, _ in current }
+            ).values
+        ).sorted { lhs, rhs in
+            if lhs.name != rhs.name {
+                return lhs.name < rhs.name
+            }
+            return lhs.type < rhs.type
+        }
+        let summaryText = envelopes
+            .map(\.summaryText)
+            .filter { $0.isEmpty == false }
+            .joined(separator: "\n")
+
+        return CompactionEnvelope(
+            summaryText: summaryText,
+            stableFacts: facts,
+            userConstraints: constraints,
+            openTasks: tasks,
+            decisions: decisions,
+            entities: entities,
+            retrievalHints: retrievalHints
+        )
+    }
+
+    private func chunked<Item>(
+        items: [Item],
+        targetTokens: Int,
+        tokenCount: (Item) -> Int
+    ) -> [[Item]] {
+        guard items.isEmpty == false else {
+            return []
+        }
+
+        let normalizedTarget = max(1, targetTokens)
+        var chunks: [[Item]] = []
+        var currentChunk: [Item] = []
+        var currentTokens = 0
+
+        for item in items {
+            let itemTokens = max(1, tokenCount(item))
+            if currentChunk.isEmpty == false && currentTokens + itemTokens > normalizedTarget {
+                chunks.append(currentChunk)
+                currentChunk = []
+                currentTokens = 0
+            }
+            currentChunk.append(item)
+            currentTokens += itemTokens
+        }
+
+        if currentChunk.isEmpty == false {
+            chunks.append(currentChunk)
+        }
+        return chunks
+    }
+
+    private func roughTokenCount(_ text: String) -> Int {
+        guard text.isEmpty == false else {
+            return 0
+        }
+        let bytes = text.lengthOfBytes(using: .utf8)
+        let words = text.split { $0.isWhitespace || $0.isNewline }.count
+        return max(
+            Int(ceil(Double(bytes) / 4.0)),
+            Int(ceil(Double(words) * 1.35))
+        )
+    }
+
     private func errorDescription(_ error: RuntimeError) -> String {
         switch error {
         case .unavailable(let value),
@@ -1176,8 +1469,19 @@ private struct WindowSession: Sendable {
     var handle: any InferenceSession
 }
 
+private struct AnyCompactionReducer: Sendable {
+    let kind: ReducerKind
+    let run: @Sendable (
+        _ manager: ContextManager,
+        _ plan: ContextPlan,
+        _ threadConfiguration: ThreadConfiguration,
+        _ options: CompactionOptions
+    ) async throws -> ContextPlan?
+}
+
 private struct ContextPlan: Sendable {
     var state: PersistedThreadState
+    var budgetEndpoint: ModelEndpoint
     var durableMemory: [DurableMemoryRecord]
     var retrievedMemory: [DurableMemoryRecord]
     var recentTail: [NormalizedTurn]
@@ -1185,6 +1489,8 @@ private struct ContextPlan: Sendable {
     var schemaDescription: String?
     var budget: BudgetReport
     var originalProjectedTotalTokens: Int?
+    var effectiveCompactionMode: CompactionMode
+    var downgradeReason: String?
     var summaryCreated = false
     var spilledBlobCount = 0
     var reducersApplied: [ReducerKind] = []

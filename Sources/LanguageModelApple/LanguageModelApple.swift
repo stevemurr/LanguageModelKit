@@ -14,7 +14,32 @@ public final class AppleInferenceBackend: InferenceBackend {
     }
 
     public func availability(for endpoint: ModelEndpoint) async -> RuntimeAvailability {
-        let model = makeModel(for: endpoint)
+        let model: SystemLanguageModel
+        do {
+            model = try makeModel(for: endpoint)
+        } catch let error as RuntimeError {
+            return RuntimeAvailability(
+                status: .unavailable(reason: AppleErrorMapper.description(for: error)),
+                capabilities: RuntimeCapabilities(
+                    supportsTextGeneration: true,
+                    supportsTextStreaming: true,
+                    supportsStructuredOutput: true,
+                    supportsExactTokenEstimation: false,
+                    supportsLocaleHints: true
+                )
+            )
+        } catch {
+            return RuntimeAvailability(
+                status: .unavailable(reason: error.localizedDescription),
+                capabilities: RuntimeCapabilities(
+                    supportsTextGeneration: true,
+                    supportsTextStreaming: true,
+                    supportsStructuredOutput: true,
+                    supportsExactTokenEstimation: false,
+                    supportsLocaleHints: true
+                )
+            )
+        }
         return RuntimeAvailability(
             status: availabilityStatus(for: model.availability),
             capabilities: RuntimeCapabilities(
@@ -32,7 +57,7 @@ public final class AppleInferenceBackend: InferenceBackend {
         instructions: String?,
         locale: Locale?
     ) async throws -> any InferenceSession {
-        let model = makeModel(for: endpoint)
+        let model = try makeModel(for: endpoint)
         if let locale, model.supportsLocale(locale) == false {
             throw RuntimeError.unsupportedLocale("Locale \(locale.identifier) is unsupported")
         }
@@ -59,7 +84,7 @@ public final class AppleInferenceBackend: InferenceBackend {
         return nil
     }
 
-    fileprivate func makeModel(for endpoint: ModelEndpoint) -> SystemLanguageModel {
+    fileprivate func makeModel(for endpoint: ModelEndpoint) throws -> SystemLanguageModel {
         if let adapterName = endpoint.options["adapter"],
            adapterName.isEmpty == false,
            let adapter = try? SystemLanguageModel.Adapter(name: adapterName) {
@@ -74,7 +99,9 @@ public final class AppleInferenceBackend: InferenceBackend {
         case "contentTagging":
             return SystemLanguageModel(useCase: .contentTagging, guardrails: guardrails(for: endpoint))
         default:
-            return SystemLanguageModel(useCase: .general, guardrails: guardrails(for: endpoint))
+            throw RuntimeError.unavailable(
+                "Unsupported Apple modelID \(endpoint.modelID). Supported values are default, general, and contentTagging."
+            )
         }
     }
 
@@ -126,7 +153,7 @@ public final class AppleStructuredOutputBackend: StructuredOutputBackend {
         spec: StructuredOutputSpec<Value>,
         options: StructuredGenerationOptions
     ) async throws -> StructuredGenerationResult<Value> {
-        let model = AppleInferenceBackend(backendID: backendID).makeModel(for: endpoint)
+        let model = try AppleInferenceBackend(backendID: backendID).makeModel(for: endpoint)
         if let locale, model.supportsLocale(locale) == false {
             throw RuntimeError.unsupportedLocale("Locale \(locale.identifier) is unsupported")
         }
@@ -171,7 +198,7 @@ public final class AppleStructuredOutputBackend: StructuredOutputBackend {
         spec: GenerableStructuredOutputSpec<Value>,
         options: StructuredGenerationOptions
     ) async throws -> StructuredGenerationResult<Value> {
-        let model = AppleInferenceBackend(backendID: backendID).makeModel(for: endpoint)
+        let model = try AppleInferenceBackend(backendID: backendID).makeModel(for: endpoint)
         if let locale, model.supportsLocale(locale) == false {
             throw RuntimeError.unsupportedLocale("Locale \(locale.identifier) is unsupported")
         }
@@ -252,7 +279,7 @@ public extension StructuredOutputSpec where Value: Generable {
 }
 
 @available(iOS 26.0, macOS 26.0, visionOS 26.0, *)
-actor AppleInferenceSession: InferenceSession {
+actor AppleInferenceSession: LiveStructuredGenerationSession {
     private let session: LanguageModelSession
 
     init(session: LanguageModelSession) {
@@ -306,6 +333,38 @@ actor AppleInferenceSession: InferenceSession {
         }
     }
 
+    func generateStructured<Value: Sendable>(
+        prompt: String,
+        spec: StructuredOutputSpec<Value>,
+        options: StructuredGenerationOptions
+    ) async throws -> StructuredGenerationResult<Value> {
+        let schema = try AppleSchemaTranslator.translate(spec.schema)
+
+        do {
+            let response = try await session.respond(
+                to: prompt,
+                schema: schema,
+                includeSchemaInPrompt: true,
+                options: makeOptions(
+                    options.maximumResponseTokens,
+                    deterministic: options.deterministic
+                )
+            )
+            let data = Data(response.rawContent.jsonString.utf8)
+            let value = try spec.decode(data)
+            return StructuredGenerationResult(
+                value: value,
+                transcriptText: spec.transcriptRenderer(value)
+            )
+        } catch let error as LanguageModelSession.GenerationError {
+            throw AppleErrorMapper.map(error)
+        } catch let error as RuntimeError {
+            throw error
+        } catch {
+            throw RuntimeError.generationFailed(error.localizedDescription)
+        }
+    }
+
     private func makeOptions(from options: TextGenerationOptions) -> GenerationOptions {
         if options.deterministic {
             return GenerationOptions(
@@ -318,6 +377,20 @@ actor AppleInferenceSession: InferenceSession {
             temperature: options.temperature,
             maximumResponseTokens: options.maximumResponseTokens
         )
+    }
+
+    private func makeOptions(
+        _ maximumResponseTokens: Int?,
+        deterministic: Bool
+    ) -> GenerationOptions {
+        if deterministic {
+            return GenerationOptions(
+                sampling: .greedy,
+                temperature: 0,
+                maximumResponseTokens: maximumResponseTokens
+            )
+        }
+        return GenerationOptions(maximumResponseTokens: maximumResponseTokens)
     }
 }
 
@@ -447,6 +520,19 @@ enum AppleErrorMapper {
             return .generationFailed(context.debugDescription)
         default:
             return .generationFailed(error.localizedDescription)
+        }
+    }
+
+    static func description(for error: RuntimeError) -> String {
+        switch error {
+        case .unavailable(let value),
+             .unsupportedCapability(let value),
+             .unsupportedLocale(let value),
+             .contextOverflow(let value),
+             .refusal(let value),
+             .generationFailed(let value),
+             .transportFailed(let value):
+            return value
         }
     }
 }

@@ -99,29 +99,12 @@ public final class OpenAIStructuredOutputBackend: StructuredOutputBackend {
     ) async throws -> StructuredGenerationResult<Value> {
         _ = locale
         let transport = try OpenAITransport(endpoint: endpoint, client: client)
-        let schemaData = try JSONSchemaRenderer.renderData(schema: spec.schema, name: "response")
-        let schemaObject = try JSONSerialization.jsonObject(with: schemaData)
-        let request = try transport.makeRequest(
+        let request = try transport.makeStructuredRequest(
             modelID: endpoint.modelID,
             instructions: instructions,
             prompt: prompt,
-            maximumResponseTokens: options.maximumResponseTokens,
-            temperature: options.deterministic ? 0 : nil,
-            stream: false,
-            extraBody: [
-                "response_format": [
-                    "type": "json_schema",
-                    "json_schema": [
-                        "name": "response",
-                        "strict": RuntimeOptionParser.bool(
-                            from: endpoint.options,
-                            key: "strictStructuredOutputs",
-                            default: true
-                        ),
-                        "schema": schemaObject
-                    ]
-                ]
-            ]
+            schema: spec.schema,
+            options: options
         )
 
         let response = try await transport.performCompletion(request)
@@ -140,7 +123,7 @@ public final class OpenAIStructuredOutputBackend: StructuredOutputBackend {
     }
 }
 
-actor OpenAIInferenceSession: InferenceSession {
+actor OpenAIInferenceSession: LiveStructuredGenerationSession {
     private let endpoint: ModelEndpoint
     private let instructions: String?
     private let locale: Locale?
@@ -174,6 +157,35 @@ actor OpenAIInferenceSession: InferenceSession {
         )
         let response = try await transport.performCompletion(request)
         return TextGenerationResult(text: try response.requireMessageContent())
+    }
+
+    func generateStructured<Value: Sendable>(
+        prompt: String,
+        spec: StructuredOutputSpec<Value>,
+        options: StructuredGenerationOptions
+    ) async throws -> StructuredGenerationResult<Value> {
+        _ = locale
+        let transport = try OpenAITransport(endpoint: endpoint, client: client)
+        let request = try transport.makeStructuredRequest(
+            modelID: endpoint.modelID,
+            instructions: instructions,
+            prompt: prompt,
+            schema: spec.schema,
+            options: options
+        )
+        let response = try await transport.performCompletion(request)
+        let payload = try response.requireMessageContent()
+        let data = Data(payload.utf8)
+
+        do {
+            let value = try spec.decode(data)
+            return StructuredGenerationResult(
+                value: value,
+                transcriptText: spec.transcriptRenderer(value)
+            )
+        } catch {
+            throw RuntimeError.generationFailed(error.localizedDescription)
+        }
     }
 
     func streamText(
@@ -274,10 +286,43 @@ private struct OpenAITransport {
         return request
     }
 
+    func makeStructuredRequest(
+        modelID: String,
+        instructions: String?,
+        prompt: String,
+        schema: OutputSchema,
+        options: StructuredGenerationOptions
+    ) throws -> URLRequest {
+        let schemaData = try PortableSchemaRenderer.renderData(schema: schema, name: "response")
+        let schemaObject = try JSONSerialization.jsonObject(with: schemaData)
+        return try makeRequest(
+            modelID: modelID,
+            instructions: instructions,
+            prompt: prompt,
+            maximumResponseTokens: options.maximumResponseTokens,
+            temperature: options.deterministic ? 0 : nil,
+            stream: false,
+            extraBody: [
+                "response_format": [
+                    "type": "json_schema",
+                    "json_schema": [
+                        "name": "response",
+                        "strict": RuntimeOptionParser.bool(
+                            from: endpoint.options,
+                            key: "strictStructuredOutputs",
+                            default: true
+                        ),
+                        "schema": schemaObject
+                    ]
+                ]
+            ]
+        )
+    }
+
     func performCompletion(_ request: URLRequest) async throws -> OpenAICompletionResponse {
         let response = try await client.data(for: request)
         if response.response.statusCode >= 400 {
-            throw try mapFailure(data: response.data, statusCode: response.response.statusCode)
+            throw mapFailure(data: response.data, statusCode: response.response.statusCode)
         }
         do {
             return try JSONDecoder().decode(OpenAICompletionResponse.self, from: response.data)
@@ -290,13 +335,20 @@ private struct OpenAITransport {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
-                    let (bytes, response) = try await client.bytes(for: request)
+                    var (bytes, response) = try await client.bytes(for: request)
                     if response.statusCode >= 400 {
-                        throw RuntimeError.transportFailed("HTTP \(response.statusCode)")
+                        let data = try await collectData(from: &bytes)
+                        throw mapFailure(data: data, statusCode: response.statusCode)
                     }
                     for try await payload in bytes.sseEvents {
                         let data = Data(payload.utf8)
+                        if let error = try? JSONDecoder().decode(OpenAIErrorEnvelope.self, from: data) {
+                            throw mapFailure(errorEnvelope: error, statusCode: nil)
+                        }
                         let chunk = try JSONDecoder().decode(OpenAIStreamResponse.self, from: data)
+                        if let runtimeError = chunk.runtimeError {
+                            throw runtimeError
+                        }
                         continuation.yield(chunk)
                     }
                     continuation.finish()
@@ -321,19 +373,94 @@ private struct OpenAITransport {
         return baseURL.appendingPathComponent("v1/chat/completions")
     }
 
-    private func mapFailure(data: Data, statusCode: Int) throws -> RuntimeError {
-        let payload = String(decoding: data, as: UTF8.self).lowercased()
-        if payload.contains("response_format") || payload.contains("json_schema") || payload.contains("strict") {
-            return .unsupportedCapability("The configured server does not support strict structured outputs")
+    private func mapFailure(data: Data, statusCode: Int) -> RuntimeError {
+        if let envelope = try? JSONDecoder().decode(OpenAIErrorEnvelope.self, from: data) {
+            return mapFailure(errorEnvelope: envelope, statusCode: statusCode)
         }
-        return .transportFailed("HTTP \(statusCode)")
+        let payload = String(decoding: data, as: UTF8.self)
+        return mapFailure(message: payload, code: nil, type: nil, statusCode: statusCode)
     }
+
+    private func mapFailure(
+        errorEnvelope: OpenAIErrorEnvelope,
+        statusCode: Int?
+    ) -> RuntimeError {
+        mapFailure(
+            message: errorEnvelope.error.message ?? "OpenAI-compatible request failed",
+            code: errorEnvelope.error.code,
+            type: errorEnvelope.error.type,
+            statusCode: statusCode
+        )
+    }
+
+    private func mapFailure(
+        message: String,
+        code: String?,
+        type: String?,
+        statusCode: Int?
+    ) -> RuntimeError {
+        let lowered = [message, code, type]
+            .compactMap { $0 }
+            .joined(separator: " ")
+            .lowercased()
+
+        if lowered.contains("response_format")
+            || lowered.contains("json_schema")
+            || lowered.contains("strict")
+        {
+            return .unsupportedCapability(
+                message.isEmpty ? "The configured server does not support strict structured outputs" : message
+            )
+        }
+
+        if lowered.contains("context_length")
+            || lowered.contains("maximum context length")
+            || lowered.contains("context window")
+            || lowered.contains("too many tokens")
+        {
+            return .contextOverflow(message)
+        }
+
+        if lowered.contains("content_filter")
+            || lowered.contains("refusal")
+            || lowered.contains("safety")
+            || lowered.contains("policy")
+        {
+            return .refusal(message)
+        }
+
+        if let statusCode {
+            return .transportFailed(message.isEmpty ? "HTTP \(statusCode)" : message)
+        }
+        return .transportFailed(message)
+    }
+
+    private func collectData(
+        from bytes: inout URLSession.AsyncBytes
+    ) async throws -> Data {
+        var data = Data()
+        for try await byte in bytes {
+            data.append(byte)
+        }
+        return data
+    }
+}
+
+private struct OpenAIErrorEnvelope: Decodable {
+    struct ErrorPayload: Decodable {
+        let message: String?
+        let type: String?
+        let code: String?
+    }
+
+    let error: ErrorPayload
 }
 
 private struct OpenAICompletionResponse: Decodable {
     struct Choice: Decodable {
         struct Message: Decodable {
             let content: ContentPayload
+            let refusal: String?
         }
 
         let message: Message
@@ -348,7 +475,19 @@ private struct OpenAICompletionResponse: Decodable {
     let choices: [Choice]
 
     func requireMessageContent() throws -> String {
-        guard let content = choices.first?.message.content.text else {
+        guard let choice = choices.first else {
+            throw RuntimeError.generationFailed("Missing completion choice")
+        }
+        if let refusal = choice.message.refusal, refusal.isEmpty == false {
+            throw RuntimeError.refusal(refusal)
+        }
+        if let refusal = choice.message.content.refusal, refusal.isEmpty == false {
+            throw RuntimeError.refusal(refusal)
+        }
+        if choice.finishReason == "content_filter" {
+            throw RuntimeError.refusal("The response was blocked by content filtering")
+        }
+        guard let content = choice.message.content.text else {
             throw RuntimeError.generationFailed("Missing completion content")
         }
         return content
@@ -359,15 +498,35 @@ private struct OpenAIStreamResponse: Decodable {
     struct Choice: Decodable {
         struct Delta: Decodable {
             let content: String?
+            let refusal: String?
         }
 
         let delta: Delta
+        let finishReason: String?
+
+        private enum CodingKeys: String, CodingKey {
+            case delta
+            case finishReason = "finish_reason"
+        }
     }
 
     let choices: [Choice]
 
     var deltaText: String {
         choices.first?.delta.content ?? ""
+    }
+
+    var runtimeError: RuntimeError? {
+        guard let choice = choices.first else {
+            return nil
+        }
+        if let refusal = choice.delta.refusal, refusal.isEmpty == false {
+            return .refusal(refusal)
+        }
+        if choice.finishReason == "content_filter" {
+            return .refusal("The response was blocked by content filtering")
+        }
+        return nil
     }
 }
 
@@ -378,17 +537,29 @@ private struct ContentPayload: Decodable {
     }
 
     let text: String?
+    let refusal: String?
 
     init(from decoder: any Decoder) throws {
         let container = try decoder.singleValueContainer()
         if let string = try? container.decode(String.self) {
             text = string
+            refusal = nil
             return
         }
         if let parts = try? container.decode([Part].self) {
-            text = parts.compactMap(\.text).joined()
+            let textual = parts
+                .filter { $0.type != "refusal" }
+                .compactMap(\.text)
+                .joined()
+            let refusalText = parts
+                .filter { $0.type == "refusal" }
+                .compactMap(\.text)
+                .joined()
+            text = textual.isEmpty ? nil : textual
+            refusal = refusalText.isEmpty ? nil : refusalText
             return
         }
         text = nil
+        refusal = nil
     }
 }

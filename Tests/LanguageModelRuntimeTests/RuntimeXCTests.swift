@@ -49,6 +49,46 @@ final class RuntimeXCTests: XCTestCase {
         XCTAssertEqual(fragments, ["fake-", "response"])
         XCTAssertEqual(completed, TextGenerationResult(text: "fake-response"))
     }
+
+    func testHTTPClientMapsTransportFailure() async {
+        let session = makeSession()
+        MockRuntimeURLProtocol.handler = { _ in
+            throw URLError(.notConnectedToInternet)
+        }
+        let client = HTTPClient(session: session)
+
+        do {
+            _ = try await client.data(for: URLRequest(url: URL(string: "https://example.com")!))
+            XCTFail("Expected transport failure")
+        } catch let error as RuntimeError {
+            XCTAssertEqual(error, .transportFailed(URLError(.notConnectedToInternet).localizedDescription))
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+    }
+
+    func testSSEParserYieldsEventsAndStopsAtDone() async throws {
+        let session = makeSession()
+        MockRuntimeURLProtocol.handler = { request in
+            let payload = "data: {\"value\":1}\n\n"
+                + "data: {\"value\":2}\n\n"
+                + "data: [DONE]\n\n"
+            return (
+                HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!,
+                Data(payload.utf8)
+            )
+        }
+        let client = HTTPClient(session: session)
+        let request = URLRequest(url: URL(string: "https://example.com/stream")!)
+        let (bytes, _) = try await client.bytes(for: request)
+
+        var events: [String] = []
+        for try await event in bytes.sseEvents {
+            events.append(event)
+        }
+
+        XCTAssertEqual(events, ["{\"value\":1}", "{\"value\":2}"])
+    }
 }
 
 private struct FakeInferenceBackend: InferenceBackend {
@@ -112,4 +152,35 @@ private actor FakeInferenceSession: InferenceSession {
             continuation.finish()
         }
     }
+}
+
+private func makeSession() -> URLSession {
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.protocolClasses = [MockRuntimeURLProtocol.self]
+    return URLSession(configuration: configuration)
+}
+
+private final class MockRuntimeURLProtocol: URLProtocol, @unchecked Sendable {
+    nonisolated(unsafe) static var handler: ((URLRequest) async throws -> (HTTPURLResponse, Data))?
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        Task {
+            do {
+                guard let handler = Self.handler else {
+                    throw RuntimeError.transportFailed("Missing URLProtocol handler")
+                }
+                let (response, data) = try await handler(request)
+                client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+                client?.urlProtocol(self, didLoad: data)
+                client?.urlProtocolDidFinishLoading(self)
+            } catch {
+                client?.urlProtocol(self, didFailWithError: error)
+            }
+        }
+    }
+
+    override func stopLoading() {}
 }

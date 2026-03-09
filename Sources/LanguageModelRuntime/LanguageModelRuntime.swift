@@ -267,39 +267,64 @@ package struct SSEParser: AsyncSequence, Sendable {
     package typealias Element = String
 
     package struct AsyncIterator: AsyncIteratorProtocol {
-        var iterator: any AsyncIteratorProtocol
+        var iterator: URLSession.AsyncBytes.AsyncIterator
 
         package mutating func next() async throws -> String? {
             var buffer: [String] = []
-            while let line = try await iterator.next() {
-                guard let line = line as? String else {
+            var lineBuffer: [UInt8] = []
+
+            while let byte = try await iterator.next() {
+                if byte == 0x0A {
+                    let line = normalizedLine(from: lineBuffer)
+                    lineBuffer.removeAll(keepingCapacity: true)
+
+                    if let payload = flush(line: line, buffer: &buffer) {
+                        return payload == "[DONE]" ? nil : payload
+                    }
                     continue
                 }
-                if line.isEmpty {
-                    if buffer.isEmpty {
-                        continue
-                    }
-                    let payload = buffer.joined(separator: "\n")
-                    buffer.removeAll(keepingCapacity: true)
-                    if payload == "[DONE]" {
-                        return nil
-                    }
-                    return payload
-                }
-
-                guard line.hasPrefix("data:") else {
-                    continue
-                }
-
-                buffer.append(String(line.dropFirst(5)).trimmingCharacters(in: .whitespaces))
+                lineBuffer.append(byte)
             }
 
+            if lineBuffer.isEmpty == false,
+               let payload = flush(line: normalizedLine(from: lineBuffer), buffer: &buffer) {
+                return payload == "[DONE]" ? nil : payload
+            }
             if buffer.isEmpty {
                 return nil
             }
 
             let payload = buffer.joined(separator: "\n")
             return payload == "[DONE]" ? nil : payload
+        }
+
+        private func normalizedLine(from bytes: [UInt8]) -> String {
+            var line = String(decoding: bytes, as: UTF8.self)
+            if line.hasSuffix("\r") {
+                line.removeLast()
+            }
+            return line
+        }
+
+        private func flush(
+            line: String,
+            buffer: inout [String]
+        ) -> String? {
+            if line.isEmpty {
+                guard buffer.isEmpty == false else {
+                    return nil
+                }
+                let payload = buffer.joined(separator: "\n")
+                buffer.removeAll(keepingCapacity: true)
+                return payload
+            }
+
+            guard line.hasPrefix("data:") else {
+                return nil
+            }
+
+            buffer.append(String(line.dropFirst(5)).trimmingCharacters(in: .whitespaces))
+            return nil
         }
     }
 
@@ -310,7 +335,7 @@ package struct SSEParser: AsyncSequence, Sendable {
     }
 
     package func makeAsyncIterator() -> AsyncIterator {
-        AsyncIterator(iterator: bytes.lines.makeAsyncIterator())
+        AsyncIterator(iterator: bytes.makeAsyncIterator())
     }
 }
 
