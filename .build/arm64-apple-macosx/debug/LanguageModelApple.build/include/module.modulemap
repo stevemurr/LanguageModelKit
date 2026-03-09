@@ -1,3 +1,0 @@
-module LanguageModelApple {
-    header "/Users/murr/Code/github.com/stevemurr/language-model-kit/.build/arm64-apple-macosx/debug/LanguageModelApple.build/include/LanguageModelApple-Swift.h"
-}
