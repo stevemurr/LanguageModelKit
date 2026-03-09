@@ -1,0 +1,3 @@
+module LanguageModelContextManagement {
+    header "/Users/murr/Code/github.com/stevemurr/language-model-kit/.build/arm64-apple-macosx/debug/LanguageModelContextManagement.build/include/LanguageModelContextManagement-Swift.h"
+}

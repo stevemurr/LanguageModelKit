@@ -1,0 +1,12 @@
+{
+  "": {
+    "swift-dependencies": "/Users/murr/Code/github.com/stevemurr/language-model-kit/.build/arm64-apple-macosx/debug/LanguageModelOpenAI.build/master.swiftdeps"
+  },
+  "/Users/murr/Code/github.com/stevemurr/language-model-kit/Sources/LanguageModelOpenAI/LanguageModelOpenAI.swift": {
+    "dependencies": "/Users/murr/Code/github.com/stevemurr/language-model-kit/.build/arm64-apple-macosx/debug/LanguageModelOpenAI.build/LanguageModelOpenAI.d",
+    "object": "/Users/murr/Code/github.com/stevemurr/language-model-kit/.build/arm64-apple-macosx/debug/LanguageModelOpenAI.build/LanguageModelOpenAI.swift.o",
+    "swiftmodule": "/Users/murr/Code/github.com/stevemurr/language-model-kit/.build/arm64-apple-macosx/debug/LanguageModelOpenAI.build/LanguageModelOpenAI~partial.swiftmodule",
+    "swift-dependencies": "/Users/murr/Code/github.com/stevemurr/language-model-kit/.build/arm64-apple-macosx/debug/LanguageModelOpenAI.build/LanguageModelOpenAI.swiftdeps",
+    "diagnostics": "/Users/murr/Code/github.com/stevemurr/language-model-kit/.build/arm64-apple-macosx/debug/LanguageModelOpenAI.build/LanguageModelOpenAI.dia"
+  }
+}

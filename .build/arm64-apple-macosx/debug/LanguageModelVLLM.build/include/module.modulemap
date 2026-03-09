@@ -1,0 +1,3 @@
+module LanguageModelVLLM {
+    header "/Users/murr/Code/github.com/stevemurr/language-model-kit/.build/arm64-apple-macosx/debug/LanguageModelVLLM.build/include/LanguageModelVLLM-Swift.h"
+}

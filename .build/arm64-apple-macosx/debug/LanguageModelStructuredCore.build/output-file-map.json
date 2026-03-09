@@ -1,0 +1,12 @@
+{
+  "": {
+    "swift-dependencies": "/Users/murr/Code/github.com/stevemurr/language-model-kit/.build/arm64-apple-macosx/debug/LanguageModelStructuredCore.build/master.swiftdeps"
+  },
+  "/Users/murr/Code/github.com/stevemurr/language-model-kit/Sources/LanguageModelStructuredCore/LanguageModelStructuredCore.swift": {
+    "dependencies": "/Users/murr/Code/github.com/stevemurr/language-model-kit/.build/arm64-apple-macosx/debug/LanguageModelStructuredCore.build/LanguageModelStructuredCore.d",
+    "object": "/Users/murr/Code/github.com/stevemurr/language-model-kit/.build/arm64-apple-macosx/debug/LanguageModelStructuredCore.build/LanguageModelStructuredCore.swift.o",
+    "swiftmodule": "/Users/murr/Code/github.com/stevemurr/language-model-kit/.build/arm64-apple-macosx/debug/LanguageModelStructuredCore.build/LanguageModelStructuredCore~partial.swiftmodule",
+    "swift-dependencies": "/Users/murr/Code/github.com/stevemurr/language-model-kit/.build/arm64-apple-macosx/debug/LanguageModelStructuredCore.build/LanguageModelStructuredCore.swiftdeps",
+    "diagnostics": "/Users/murr/Code/github.com/stevemurr/language-model-kit/.build/arm64-apple-macosx/debug/LanguageModelStructuredCore.build/LanguageModelStructuredCore.dia"
+  }
+}

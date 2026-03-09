@@ -1,0 +1,12 @@
+{
+  "": {
+    "swift-dependencies": "/Users/murr/Code/github.com/stevemurr/language-model-kit/.build/arm64-apple-macosx/debug/LanguageModelIntegrationTests.build/master.swiftdeps"
+  },
+  "/Users/murr/Code/github.com/stevemurr/language-model-kit/Tests/LanguageModelIntegrationTests/IntegrationXCTests.swift": {
+    "dependencies": "/Users/murr/Code/github.com/stevemurr/language-model-kit/.build/arm64-apple-macosx/debug/LanguageModelIntegrationTests.build/IntegrationXCTests.d",
+    "object": "/Users/murr/Code/github.com/stevemurr/language-model-kit/.build/arm64-apple-macosx/debug/LanguageModelIntegrationTests.build/IntegrationXCTests.swift.o",
+    "swiftmodule": "/Users/murr/Code/github.com/stevemurr/language-model-kit/.build/arm64-apple-macosx/debug/LanguageModelIntegrationTests.build/IntegrationXCTests~partial.swiftmodule",
+    "swift-dependencies": "/Users/murr/Code/github.com/stevemurr/language-model-kit/.build/arm64-apple-macosx/debug/LanguageModelIntegrationTests.build/IntegrationXCTests.swiftdeps",
+    "diagnostics": "/Users/murr/Code/github.com/stevemurr/language-model-kit/.build/arm64-apple-macosx/debug/LanguageModelIntegrationTests.build/IntegrationXCTests.dia"
+  }
+}

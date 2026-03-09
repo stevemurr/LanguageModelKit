@@ -1,0 +1,12 @@
+{
+  "": {
+    "swift-dependencies": "/Users/murr/Code/github.com/stevemurr/language-model-kit/.build/arm64-apple-macosx/debug/LanguageModelVLLM.build/master.swiftdeps"
+  },
+  "/Users/murr/Code/github.com/stevemurr/language-model-kit/Sources/LanguageModelVLLM/LanguageModelVLLM.swift": {
+    "dependencies": "/Users/murr/Code/github.com/stevemurr/language-model-kit/.build/arm64-apple-macosx/debug/LanguageModelVLLM.build/LanguageModelVLLM.d",
+    "object": "/Users/murr/Code/github.com/stevemurr/language-model-kit/.build/arm64-apple-macosx/debug/LanguageModelVLLM.build/LanguageModelVLLM.swift.o",
+    "swiftmodule": "/Users/murr/Code/github.com/stevemurr/language-model-kit/.build/arm64-apple-macosx/debug/LanguageModelVLLM.build/LanguageModelVLLM~partial.swiftmodule",
+    "swift-dependencies": "/Users/murr/Code/github.com/stevemurr/language-model-kit/.build/arm64-apple-macosx/debug/LanguageModelVLLM.build/LanguageModelVLLM.swiftdeps",
+    "diagnostics": "/Users/murr/Code/github.com/stevemurr/language-model-kit/.build/arm64-apple-macosx/debug/LanguageModelVLLM.build/LanguageModelVLLM.dia"
+  }
+}
